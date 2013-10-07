@@ -1,4 +1,3 @@
-
 //          Copyright Brian Schott (Sir Alaran) 2012.
 // Distributed under the Boost Software License, Version 1.0.
 //    (See accompanying file LICENSE_1_0.txt or copy at
@@ -6,331 +5,259 @@
 
 module main;
 
-
-import std.file;
-import std.stdio;
 import std.algorithm;
-import std.conv;
 import std.array;
-import std.path;
-import std.regex;
+import std.conv;
+import std.file;
 import std.getopt;
 import std.parallelism;
-import types;
-import tokenizer;
-import parser;
-import langutils;
-import autocomplete;
+import std.path;
+import std.regex;
+import std.stdio;
+import std.range;
+import stdx.d.lexer;
+import stdx.d.parser;
+
 import highlighter;
-
-pure bool isLineOfCode(TokenType t)
-{
-	switch(t)
-	{
-	case TokenType.Semicolon:
-	case TokenType.While:
-	case TokenType.If:
-	case TokenType.For:
-	case TokenType.Foreach:
-	case TokenType.Foreach_reverse:
-	case TokenType.Case:
-		return true;
-	default:
-		return false;
-	}
-}
-
-/**
- * Loads any import directories specified in /etc/dmd.conf.
- * Bugs: Only works on Linux
- * Returns: the paths specified as -I options in /etc/dmd.conf
- */
-string[] loadDefaultImports()
-{
-version(linux)
-{
-	string path = "/etc/dmd.conf";
-	if (!exists(path))
-		return [];
-	string[] rVal;
-	auto file = File(path, "r");
-	foreach(char[] line; file.byLine())
-	{
-		if (!line.startsWith("DFLAGS"))
-			continue;
-		while ((line = line.find("-I")).length > 0)
-		{
-			auto end = std.string.indexOf(line, " ");
-			auto importDir = line[2 .. end].idup;
-			rVal ~= importDir;
-			line = line[end .. $];
-		}
-	}
-	return rVal;
-}
-else
-{
-	return [];
-}
-}
-
-/**
- * Returns: the absolute path of the given module, or null if it could not be
- *     found.
- */
-string findAbsPath(string[] dirs, string moduleName)
-{
-	// For file names
-	if (endsWith(moduleName, ".d") || endsWith(moduleName, ".di"))
-	{
-		if (isAbsolute(moduleName))
-			return moduleName;
-		else
-			return buildPath(getcwd(), moduleName);
-	}
-
-	// Try to find the file name from a module name like "std.stdio"
-	foreach(dir; dirs)
-	{
-		string fileLocation = buildPath(dir, replace(moduleName, ".", dirSeparator));
-		string dfile = fileLocation ~ ".d";
-		if (exists(dfile) && isFile(dfile))
-		{
-			return dfile;
-		}
-		if (exists(fileLocation  ~ ".di") && isFile(fileLocation  ~ ".di"))
-		{
-			return fileLocation ~ ".di";
-		}
-	}
-	stderr.writeln("Could not locate import ", moduleName, " in ", dirs);
-	return null;
-}
-
-string[] loadConfig()
-{
-	string path = expandTilde("~" ~ dirSeparator ~ ".dscanner");
-	string[] dirs;
-	if (exists(path))
-	{
-		auto f = File(path, "r");
-		scope(exit) f.close();
-
-		auto trimRegex = ctRegex!(`\s*$`);
-		foreach(string line; lines(f))
-		{
-			dirs ~= replace(line, trimRegex, "");
-		}
-	}
-	foreach(string importDir; loadDefaultImports()) {
-		dirs ~= importDir;
-	}
-	return dirs;
-}
+import stats;
+import ctags;
+import astprinter;
+import imports;
+import outliner;
 
 int main(string[] args)
 {
-	string[] importDirs;
 	bool sloc;
-	bool dotComplete;
-	bool json;
-	bool parenComplete;
 	bool highlight;
 	bool ctags;
-	bool recursiveCtags;
+	bool recursive;
 	bool format;
 	bool help;
+	bool tokenCount;
+	bool syntaxCheck;
+	bool ast;
+	bool imports;
+	bool muffin;
+	bool outline;
 
 	try
 	{
-		getopt(args, "I", &importDirs, "dotComplete", &dotComplete, "sloc", &sloc,
-			"json", &json, "parenComplete", &parenComplete, "highlight", &highlight,
-			"ctags", &ctags, "recursive|r|R", &recursiveCtags, "help|h", &help);
+		getopt(args, "sloc|l", &sloc, "highlight", &highlight,
+			"ctags|c", &ctags, "recursive|r|R", &recursive, "help|h", &help,
+			"tokenCount|t", &tokenCount, "syntaxCheck|s", &syntaxCheck,
+			"ast|xml", &ast, "imports|i", &imports, "outline|o", &outline,
+			"muffinButton", &muffin);
 	}
 	catch (Exception e)
 	{
 		stderr.writeln(e.msg);
 	}
 
-	if (help)
+	if (muffin)
 	{
-		printHelp();
+		stdout.writeln(
+`       ___________
+    __(#*O 0** @%*)__
+  _(%*o#*O%*0 #O#%##@)_
+ (*#@%#o*@ #o%O*%@ #o #)
+ \=====================/
+  |I|I|I|I|I|I|I|I|I|I|
+  |I|I|I|I|I|I|I|I|I|I|
+  |I|I|I|I|I|I|I|I|I|I|
+  |I|I|I|I|I|I|I|I|I|I|`);
 		return 0;
 	}
 
-	importDirs ~= loadConfig();
-
-	if (sloc)
+	if (help)
 	{
-		if (args.length == 1)
-		{
-			auto f = appender!string();
-			char[] buf;
-			while (stdin.readln(buf))
-				f.put(buf);
-			writeln(f.data.tokenize().count!(a => isLineOfCode(a.type))());
-		}
-		else
-		{
-			writeln(args[1..$].map!(a => a.readText().tokenize())().joiner()
-				.count!(a => isLineOfCode(a.type))());
-		}
+		printHelp(args[0]);
 		return 0;
+	}
+
+	auto optionCount = count!"a"([sloc, highlight, ctags, tokenCount,
+		syntaxCheck, ast, imports, outline]);
+	if (optionCount > 1)
+	{
+		stderr.writeln("Too many options specified");
+		return 1;
+	}
+	else if (optionCount < 1)
+	{
+		printHelp(args[0]);
+		return 1;
 	}
 
 	if (highlight)
 	{
-		if (args.length == 1)
-		{
-			auto f = appender!string();
-			char[] buf;
-			while (stdin.readln(buf))
-				f.put(buf);
-			highlighter.highlight(f.data.tokenize(IterationStyle.EVERYTHING));
-		}
-		else
-		{
-			highlighter.highlight(args[1].readText().tokenize(IterationStyle.EVERYTHING));
-		}
+		LexerConfig config;
+		config.iterStyle = IterationStyle.everything;
+		config.tokenStyle = TokenStyle.source;
+		bool usingStdin = args.length == 1;
+		ubyte[] bytes = usingStdin ? readStdin() : readFile(args[1]);
+		highlighter.highlight(byToken(bytes, config),
+			args.length == 1 ? "stdin" : args[1]);
 		return 0;
 	}
-
-	if (dotComplete || parenComplete)
+	else if (ctags)
 	{
-		if (isAbsolute(args[1]))
-			importDirs ~= dirName(args[1]);
-		else
-			importDirs ~= getcwd();
-		Token[] tokens;
-		try
-		{
-			to!size_t(args[1]);
-			auto f = appender!string();
-			char[] buf;
-			while (stdin.readln(buf))
-				f.put(buf);
-			tokens = f.data.tokenize();
-		}
-		catch(ConvException e)
-		{
-			tokens = args[1].readText().tokenize();
-			args.popFront();
-		}
-		auto mod = parseModule(tokens);
-		CompletionContext context = new CompletionContext(mod);
-		context.importDirectories = importDirs;
-		foreach (im; parallel(mod.imports))
-		{
-			auto p = findAbsPath(importDirs, im);
-			if (p is null || !p.exists())
-				continue;
-			context.addModule(p.readText().tokenize().parseModule());
-		}
-		auto complete = AutoComplete(tokens, context);
-		if (parenComplete)
-			writeln(complete.parenComplete(to!size_t(args[1])));
-		else if (dotComplete)
-			writeln(complete.dotComplete(to!size_t(args[1])));
-		return 0;
+		stdout.printCtags(expandArgs(args, recursive));
 	}
-
-	if (json)
+	else
 	{
-		Token[] tokens;
-		if (args.length == 1)
+		LexerConfig config;
+		bool usingStdin = args.length == 1;
+		if (sloc || tokenCount)
 		{
-			// Read from stdin
-			auto f = appender!string();
-			char[] buf;
-			while (stdin.readln(buf))
-				f.put(buf);
-			tokens = tokenize(f.data);
-		}
-		else
-		{
-			// read given file
-			tokens = tokenize(readText(args[1]));
-		}
-		auto mod = parseModule(tokens);
-		mod.writeJSONTo(stdout);
-		return 0;
-	}
-
-	if (ctags)
-	{
-		if (!recursiveCtags)
-		{
-			auto tokens = tokenize(readText(args[1]));
-			auto mod = parseModule(tokens);
-			mod.writeCtagsTo(stdout, args[1]);
-		}
-		else
-		{
-			Module m;
-			foreach (dirEntry; dirEntries(args[1], SpanMode.breadth))
+			if (usingStdin)
 			{
-				if (!dirEntry.name.endsWith(".d", ".di"))
-					continue;
-				stderr.writeln("Generating tags for ", dirEntry.name);
-				auto tokens = tokenize(readText(dirEntry.name));
-				if (m is null)
-					m = parseModule(tokens);
+				auto tokens = byToken(readStdin(), config);
+				if (tokenCount)
+					printTokenCount(stdout, "stdin", tokens);
 				else
-				{
-					auto mod = parseModule(tokens);
-					m.merge(mod);
-				}
+					printLineCount(stdout, "stdin", tokens);
 			}
-			m.writeCtagsTo(stdout, "");
+			else
+			{
+				ulong count;
+				foreach (f; expandArgs(args, recursive))
+				{
+					auto tokens = byToken(readFile(f), config);
+					if (tokenCount)
+						count += printTokenCount(stdout, f, tokens);
+					else
+						count += printLineCount(stdout, f, tokens);
+				}
+				writefln("total:\t%d", count);
+			}
+		}
+		else if (syntaxCheck)
+		{
+			auto tokens = byToken(usingStdin ? readStdin() : readFile(args[1]),
+				config);
+			parseModule(tokens.array(), config.fileName);
+		}
+		else if (imports)
+		{
+			auto tokens = byToken(usingStdin ? readStdin() : readFile(args[1]),
+				config);
+			auto mod = parseModule(tokens.array(), config.fileName);
+			auto visitor = new ImportPrinter;
+			visitor.visit(mod);
+		}
+		else if (ast)
+		{
+			auto tokens = byToken(usingStdin ? readStdin() : readFile(args[1]),
+				config);
+			auto mod = parseModule(tokens.array(), config.fileName);
+			auto printer = new XMLPrinter;
+			printer.output = stdout;
+			printer.visit(mod);
+		}
+		else if (outline)
+		{
+			auto tokens = byToken(usingStdin ? readStdin() : readFile(args[1]),
+				config);
+			auto mod = parseModule(tokens.array(), config.fileName);
+			auto outliner = new Outliner(stdout);
+			outliner.visit(mod);
 		}
 	}
 	return 0;
 }
 
-void printHelp()
+string[] expandArgs(string[] args, bool recursive)
 {
-	writeln(
-q{
-    Usage: dscanner options
+	if (recursive)
+	{
+		string[] rVal;
+		foreach (arg; args[1 ..$])
+		{
+			if (isFile(arg) && arg.endsWith(`.d`) || arg.endsWith(`.di`))
+				rVal ~= arg;
+			else foreach (item; dirEntries(arg, SpanMode.breadth).map!(a => a.name))
+			{
+				if (isFile(item) && (item.endsWith(`.d`) || item.endsWith(`.di`)))
+					rVal ~= item;
+				else
+					continue;
+			}
+		}
+		return rVal;
+	}
+	else
+		return args[1 .. $];
+}
+
+ubyte[] readStdin()
+{
+	auto sourceCode = appender!(ubyte[])();
+	ubyte[4096] buf;
+	while (true)
+	{
+		auto b = stdin.rawRead(buf);
+		if (b.length == 0)
+			break;
+		sourceCode.put(b);
+	}
+	return sourceCode.data;
+}
+
+ubyte[] readFile(string fileName)
+{
+	if (!exists(fileName))
+	{
+		stderr.writefln("%s does not exist", fileName);
+		return [];
+	}
+	File f = File(fileName);
+	ubyte[] sourceCode = uninitializedArray!(ubyte[])(to!size_t(f.size));
+	f.rawRead(sourceCode);
+	return sourceCode;
+}
+
+void printHelp(string programName)
+{
+	stderr.writefln(
+`
+    Usage: %s options
 
 options:
     --help | -h
         Prints this help message
 
-    --sloc [sourceFiles]
-        count the number of logical lines of code in the given
-        source files. If no files are specified, a file is read from stdin.
+    --sloc | -l [sourceFiles]
+        Prints the number of logical lines of code in the given
+        source files. If no files are specified, input is read from stdin.
 
-    --json [sourceFile]
-        Generate a JSON summary of the given source file. If no file is
-        specifed, the file is read from stdin.
-
-    --dotComplete [sourceFile] cursorPosition
-        Provide autocompletion for the insertion of the dot operator. The cursor
-        position is the character position in the *file*, not the position in
-        the line. If no file is specified, the file is read from stdin.
-
-    --parenComplete [sourceFile] cursorPosition
-        Provides a listing of function parameters or pre-defined version
-        identifiers at the cursor position. The cursor position is the character
-        position in the *file*, not the line. If no file is specified, the
-        contents are read from stdin.
+    --tokenCount | t [sourceFiles]
+        Prints the number of tokens in the given source files. If no files are
+        specified, input is read from stdin.
 
     --highlight [sourceFile] - Syntax-highlight the given source file. The
-        resulting HTML will be written to standard output.
+        resulting HTML will be written to standard output. If no files are
+        specified, input is read from stdin.
 
-    -I includePath
-        Include _includePath_ in the list of paths used to search for imports.
-        By default dscanner will search in the current working directory as
-        well as any paths specified in /etc/dmd.conf. This is only used for the
-        --parenComplete and --dotComplete options.
+    --imports | -i [sourceFile]
+        Prints modules imported by the given source file. If no files are
+        specified, input is read from stdin.
 
-    --ctags sourceFile
+    --syntaxCheck | -s [sourceFile]
+        Lexes and parses sourceFile, printing the line and column number of any
+        syntax errors to stdout. One error or warning is printed per line.
+        If no files are specified, input is read from stdin.
+
+    --ctags | -c sourceFile
         Generates ctags information from the given source code file. Note that
         ctags information requires a filename, so stdin cannot be used in place
         of a filename.
 
-    --recursive | -R | -r directory
-        When used with --ctags, dscanner will produce ctags output for all .d
-        and .di files contained within directory and its sub-directories.});
+    --ast | --xml sourceFile
+        Generates an XML representation of the source files abstract syntax
+        tree. If no files are specified, input is read from stdin.
+
+    --recursive | -R | -r
+        When used with --ctags, --tokenCount, or --sloc, dscanner will produce
+        ctags output for all .d and .di files contained within the given
+        directories and its sub-directories.`,
+        programName);
 }
